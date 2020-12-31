@@ -567,9 +567,11 @@ ccp_resetci(f)
 	    return;
 	}
 	if (!numbits) {
-	    error("MPPE required, but MS-CHAP[v2] auth not performed.");
-	    lcp_close(f->unit, "MPPE required but not available");
-	    return;
+	    /*
+	     * error("MPPE required, but MS-CHAP[v2] auth not performed.");
+	     * lcp_close(f->unit, "MPPE required but not available");
+	     * return;
+	     */
 	}
 
 	/* A plugin (eg radius) may not have obtained key material. */
