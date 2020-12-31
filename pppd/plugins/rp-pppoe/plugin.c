@@ -68,6 +68,9 @@ static char *existingSession = NULL;
 static int printACNames = 0;
 static char *pppoe_reqd_mac = NULL;
 unsigned char pppoe_reqd_mac_addr[6];
+static char *host_uniq;
+static int pppoe_padi_timeout = PADI_TIMEOUT;
+static int pppoe_padi_attempts = MAX_PADI_ATTEMPTS;
 
 static int PPPoEDevnameHook(char *cmd, char **argv, int doit);
 static option_t Options[] = {
@@ -85,6 +88,12 @@ static option_t Options[] = {
       "Be verbose about discovered access concentrators"},
     { "pppoe-mac", o_string, &pppoe_reqd_mac,
       "Only connect to specified MAC address" },
+    { "host-uniq", o_string, &host_uniq,
+      "Set the Host-Uniq to the supplied hex string" },
+    { "pppoe-padi-timeout", o_int, &pppoe_padi_timeout,
+      "Initial timeout for discovery packets in seconds" },
+    { "pppoe-padi-attempts", o_int, &pppoe_padi_attempts,
+      "Number of discovery attempts" },
     { NULL }
 };
 int (*OldDevnameHook)(char *cmd, char **argv, int doit) = NULL;
@@ -110,9 +119,9 @@ PPPOEInitDevice(void)
     conn->ifName = devnam;
     conn->discoverySocket = -1;
     conn->sessionSocket = -1;
-    conn->useHostUniq = 1;
     conn->printACNames = printACNames;
-    conn->discoveryTimeout = PADI_TIMEOUT;
+    conn->discoveryTimeout = pppoe_padi_timeout;
+    conn->discoveryAttempts = pppoe_padi_attempts;
     return 1;
 }
 
@@ -153,7 +162,7 @@ PPPOEConnectDevice(void)
 	error("Can't get MTU for %s: %m", conn->ifName);
 	goto errout;
     }
-    strncpy(ifr.ifr_name, conn->ifName, sizeof(ifr.ifr_name));
+    strlcpy(ifr.ifr_name, conn->ifName, sizeof(ifr.ifr_name));
     if (ioctl(s, SIOCGIFMTU, &ifr) < 0) {
 	error("Can't get MTU for %s: %m", conn->ifName);
 	close(s);
@@ -165,6 +174,17 @@ PPPOEConnectDevice(void)
 	lcp_allowoptions[0].mru = ifr.ifr_mtu - TOTAL_OVERHEAD;
     if (lcp_wantoptions[0].mru > ifr.ifr_mtu - TOTAL_OVERHEAD)
 	lcp_wantoptions[0].mru = ifr.ifr_mtu - TOTAL_OVERHEAD;
+
+    if (host_uniq) {
+	if (!parseHostUniq(host_uniq, &conn->hostUniq))
+	    fatal("Illegal value for host-uniq option");
+    } else {
+	/* if a custom host-uniq is not supplied, use our PID */
+	pid_t pid = getpid();
+	conn->hostUniq.type = htons(TAG_HOST_UNIQ);
+	conn->hostUniq.length = htons(sizeof(pid));
+	memcpy(conn->hostUniq.payload, &pid, sizeof(pid));
+    }
 
     conn->acName = acName;
     conn->serviceName = pppd_pppoe_service;
@@ -270,19 +290,22 @@ PPPOEDisconnectDevice(void)
     memcpy(sp.sa_addr.pppoe.dev, conn->ifName, IFNAMSIZ);
     memcpy(sp.sa_addr.pppoe.remote, conn->peerEth, ETH_ALEN);
     if (connect(conn->sessionSocket, (struct sockaddr *) &sp,
-		sizeof(struct sockaddr_pppox)) < 0)
+		sizeof(struct sockaddr_pppox)) < 0 && errno != EALREADY)
 	error("Failed to disconnect PPPoE socket: %d %m", errno);
     close(conn->sessionSocket);
-    /* don't send PADT?? */
-    if (conn->discoverySocket >= 0)
+    if (conn->discoverySocket >= 0) {
+        sendPADT(conn, NULL);
 	close(conn->discoverySocket);
+    }
 }
 
 static void
 PPPOEDeviceOptions(void)
 {
-    char buf[256];
-    snprintf(buf, 256, _PATH_ETHOPT "%s", devnam);
+    char buf[MAXPATHLEN];
+
+    strlcpy(buf, _PATH_ETHOPT, MAXPATHLEN);
+    strlcat(buf, devnam, MAXPATHLEN);
     if (!options_from_file(buf, 0, 0, 1))
 	exit(EXIT_OPTION_ERROR);
 
@@ -326,7 +349,7 @@ PPPoEDevnameHook(char *cmd, char **argv, int doit)
 
     /* Try getting interface index */
     if (r) {
-	strncpy(ifr.ifr_name, cmd, sizeof(ifr.ifr_name));
+	strlcpy(ifr.ifr_name, cmd, sizeof(ifr.ifr_name));
 	if (ioctl(fd, SIOCGIFINDEX, &ifr) < 0) {
 	    r = 0;
 	} else {
@@ -345,7 +368,7 @@ PPPoEDevnameHook(char *cmd, char **argv, int doit)
     /* Close socket */
     close(fd);
     if (r && doit) {
-	strncpy(devnam, cmd, sizeof(devnam));
+	strlcpy(devnam, cmd, sizeof(devnam));
 	if (the_channel != &pppoe_channel) {
 
 	    the_channel = &pppoe_channel;

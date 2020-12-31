@@ -80,7 +80,6 @@
 #include <netdb.h>
 #include <utmp.h>
 #include <pwd.h>
-#include <setjmp.h>
 #include <sys/param.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -121,10 +120,9 @@
 #include "atcp.h"
 #endif
 
-static const char rcsid[] = RCSID;
 
 /* interface vars */
-char ifname[32];		/* Interface name */
+char ifname[MAXIFNAMELEN];	/* Interface name */
 int ifunit;			/* Interface unit number */
 
 struct channel *the_channel;
@@ -181,7 +179,7 @@ int got_sighup;
 
 static sigset_t signals_handled;
 static int waiting;
-static sigjmp_buf sigjmp;
+static int sigpipe[2];
 
 char **script_env;		/* Env. variable values for scripts */
 int s_env_nalloc;		/* # words avail at script_env */
@@ -257,7 +255,6 @@ static void cleanup_db __P((void));
 static void handle_events __P((void));
 void print_link_stats __P((void));
 
-extern	char	*ttyname __P((int));
 extern	char	*getlogin __P((void));
 int main __P((int, char *[]));
 
@@ -297,13 +294,6 @@ struct protent *protocols[] = {
     &eap_protent,
     NULL
 };
-
-/*
- * If PPP_DRV_NAME is not defined, use the default "ppp" as the device name.
- */
-#if !defined(PPP_DRV_NAME)
-#define PPP_DRV_NAME	"ppp"
-#endif /* !defined(PPP_DRV_NAME) */
 
 int
 main(argc, argv)
@@ -607,19 +597,21 @@ static void
 handle_events()
 {
     struct timeval timo;
+    unsigned char buf[16];
 
     kill_link = open_ccp_flag = 0;
-    if (sigsetjmp(sigjmp, 1) == 0) {
-	sigprocmask(SIG_BLOCK, &signals_handled, NULL);
-	if (got_sighup || got_sigterm || got_sigusr2 || got_sigchld) {
-	    sigprocmask(SIG_UNBLOCK, &signals_handled, NULL);
-	} else {
-	    waiting = 1;
-	    sigprocmask(SIG_UNBLOCK, &signals_handled, NULL);
-	    wait_input(timeleft(&timo));
-	}
-    }
+
+    /* alert via signal pipe */
+    waiting = 1;
+    /* flush signal pipe */
+    for (; read(sigpipe[0], buf, sizeof(buf)) > 0; );
+    add_fd(sigpipe[0]);
+    /* wait if necessary */
+    if (!(got_sighup || got_sigterm || got_sigusr2 || got_sigchld))
+	wait_input(timeleft(&timo));
     waiting = 0;
+    remove_fd(sigpipe[0]);
+
     calltimeout();
     if (got_sighup) {
 	info("Hangup (SIGHUP)");
@@ -653,6 +645,14 @@ static void
 setup_signals()
 {
     struct sigaction sa;
+
+    /* create pipe to wake up event handler from signal handler */
+    if (pipe(sigpipe) < 0)
+	fatal("Couldn't create signal pipe: %m");
+    fcntl(sigpipe[0], F_SETFD, fcntl(sigpipe[0], F_GETFD) | FD_CLOEXEC);
+    fcntl(sigpipe[1], F_SETFD, fcntl(sigpipe[1], F_GETFD) | FD_CLOEXEC);
+    fcntl(sigpipe[0], F_SETFL, fcntl(sigpipe[0], F_GETFL) | O_NONBLOCK);
+    fcntl(sigpipe[1], F_SETFL, fcntl(sigpipe[1], F_GETFL) | O_NONBLOCK);
 
     /*
      * Compute mask of all interesting signals and install signal handlers
@@ -737,9 +737,16 @@ void
 set_ifunit(iskey)
     int iskey;
 {
-    info("Using interface %s%d", PPP_DRV_NAME, ifunit);
-    slprintf(ifname, sizeof(ifname), "%s%d", PPP_DRV_NAME, ifunit);
+    char ifkey[32];
+
+    if (req_ifname[0] != '\0')
+	slprintf(ifname, sizeof(ifname), "%s", req_ifname);
+    else
+	slprintf(ifname, sizeof(ifname), "%s%d", PPP_DRV_NAME, ifunit);
+    info("Using interface %s", ifname);
     script_setenv("IFNAME", ifname, iskey);
+    slprintf(ifkey, sizeof(ifkey), "%d", ifunit);
+    script_setenv("UNIT", ifkey, iskey);
     if (iskey) {
 	create_pidfile(getpid());	/* write pid to file */
 	create_linkpidfile(getpid());
@@ -1437,7 +1444,7 @@ hup(sig)
 	kill_my_pg(sig);
     notify(sigreceived, sig);
     if (waiting)
-	siglongjmp(sigjmp, 1);
+	write(sigpipe[1], &sig, sizeof(sig));
 }
 
 
@@ -1458,7 +1465,7 @@ term(sig)
 	kill_my_pg(sig);
     notify(sigreceived, sig);
     if (waiting)
-	siglongjmp(sigjmp, 1);
+	write(sigpipe[1], &sig, sizeof(sig));
 }
 
 
@@ -1472,7 +1479,7 @@ chld(sig)
 {
     got_sigchld = 1;
     if (waiting)
-	siglongjmp(sigjmp, 1);
+	write(sigpipe[1], &sig, sizeof(sig));
 }
 
 
@@ -1507,7 +1514,7 @@ open_ccp(sig)
 {
     got_sigusr2 = 1;
     if (waiting)
-	siglongjmp(sigjmp, 1);
+	write(sigpipe[1], &sig, sizeof(sig));
 }
 
 
@@ -1571,7 +1578,8 @@ safe_fork(int infd, int outfd, int errfd)
 	/* Executing in the child */
 	sys_close();
 #ifdef USE_TDB
-	tdb_close(pppdb);
+	if (pppdb != NULL)
+		tdb_close(pppdb);
 #endif
 
 	/* make sure infd, outfd and errfd won't get tromped on below */
@@ -1756,7 +1764,7 @@ update_script_environment()
 		script_env[i] = newstring;
 	    else
 		add_script_env(i, newstring);
-	} else {
+	} else if (p != NULL) {
 	    remove_script_env(i);
 	}
     }

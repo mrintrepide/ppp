@@ -55,7 +55,6 @@
 #include "pppd.h"
 #include "fsm.h"
 
-static const char rcsid[] = RCSID;
 
 static void fsm_timeout __P((void *));
 static void fsm_rconfreq __P((fsm *, int, u_char *, int));
@@ -468,7 +467,7 @@ fsm_rconfreq(f, id, inp, len)
 	f->nakloops = 0;
 
     } else {
-	/* we sent CONFACK or CONFREJ */
+	/* we sent CONFNAK or CONFREJ */
 	if (f->state != ACKRCVD)
 	    f->state = REQSENT;
 	if( code == CONFNAK )
